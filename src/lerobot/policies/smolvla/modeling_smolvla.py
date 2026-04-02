@@ -556,6 +556,11 @@ class VLAFlowMatching(nn.Module):
     def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
+        self.debug_collect_velocity_trace = False
+        self.last_velocity_trace: list[torch.Tensor] = []
+        self.last_velocity_trace_times: list[float] = []
+        self.last_xt_trace: list[torch.Tensor] = []
+        self.last_final_action: torch.Tensor | None = None
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -602,6 +607,16 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def set_debug_velocity_trace(self, enabled: bool) -> None:
+        self.debug_collect_velocity_trace = enabled
+        self.clear_debug_velocity_trace()
+
+    def clear_debug_velocity_trace(self) -> None:
+        self.last_velocity_trace = []
+        self.last_velocity_trace_times = []
+        self.last_xt_trace = []
+        self.last_final_action = None
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -834,9 +849,14 @@ class VLAFlowMatching(nn.Module):
         dt = -1.0 / num_steps
 
         x_t = noise
+        if self.debug_collect_velocity_trace:
+            self.clear_debug_velocity_trace()
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            if self.debug_collect_velocity_trace:
+                self.last_xt_trace.append(x_t.detach().to("cpu"))
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -862,10 +882,18 @@ class VLAFlowMatching(nn.Module):
             else:
                 v_t = denoise_step_partial_call(x_t)
 
+            if self.debug_collect_velocity_trace:
+                self.last_velocity_trace.append(v_t.detach().to("cpu"))
+                self.last_velocity_trace_times.append(float(time))
+
             x_t = x_t + dt * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        if self.debug_collect_velocity_trace:
+            self.last_xt_trace.append(x_t.detach().to("cpu"))
+            self.last_final_action = x_t.detach().to("cpu")
 
         return x_t
 
