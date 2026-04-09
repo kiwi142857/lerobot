@@ -561,6 +561,9 @@ class VLAFlowMatching(nn.Module):
         self.last_velocity_trace_times: list[float] = []
         self.last_xt_trace: list[torch.Tensor] = []
         self.last_final_action: torch.Tensor | None = None
+        self.last_prefix_pad_masks: torch.Tensor | None = None
+        self.last_past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.last_past_key_values_debug: str = ""
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -617,6 +620,50 @@ class VLAFlowMatching(nn.Module):
         self.last_velocity_trace_times = []
         self.last_xt_trace = []
         self.last_final_action = None
+        self.last_prefix_pad_masks = None
+        self.last_past_key_values = []
+        self.last_past_key_values_debug = ""
+
+    @staticmethod
+    def _extract_legacy_past_key_values(past_key_values):
+        if past_key_values is None:
+            return []
+        if isinstance(past_key_values, dict):
+            extracted: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for layer_idx in sorted(past_key_values.keys()):
+                layer_cache = past_key_values[layer_idx]
+                if not isinstance(layer_cache, dict):
+                    continue
+                key_tensor = layer_cache.get("key_states")
+                value_tensor = layer_cache.get("value_states")
+                if torch.is_tensor(key_tensor) and torch.is_tensor(value_tensor):
+                    extracted.append((key_tensor, value_tensor))
+            if len(extracted) > 0:
+                return extracted
+        if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+            key_cache = list(past_key_values.key_cache)
+            value_cache = list(past_key_values.value_cache)
+            extracted: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for key_tensor, value_tensor in zip(key_cache, value_cache, strict=False):
+                if torch.is_tensor(key_tensor) and torch.is_tensor(value_tensor):
+                    extracted.append((key_tensor, value_tensor))
+            if len(extracted) > 0:
+                return extracted
+        if hasattr(past_key_values, "to_legacy_cache"):
+            past_key_values = past_key_values.to_legacy_cache()
+        if isinstance(past_key_values, tuple):
+            past_key_values = list(past_key_values)
+        if not isinstance(past_key_values, list):
+            return []
+
+        extracted: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_cache in past_key_values:
+            if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) < 2:
+                continue
+            key_cache, value_cache = layer_cache[0], layer_cache[1]
+            if torch.is_tensor(key_cache) and torch.is_tensor(value_cache):
+                extracted.append((key_cache, value_cache))
+        return extracted
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -851,6 +898,15 @@ class VLAFlowMatching(nn.Module):
         x_t = noise
         if self.debug_collect_velocity_trace:
             self.clear_debug_velocity_trace()
+            extracted_past_key_values = self._extract_legacy_past_key_values(past_key_values)
+            self.last_prefix_pad_masks = prefix_pad_masks.detach().to("cpu")
+            self.last_past_key_values = [
+                (k.detach().to("cpu"), v.detach().to("cpu"))
+                for k, v in extracted_past_key_values
+            ]
+            self.last_past_key_values_debug = (
+                f"type={type(past_key_values)} extracted_layers={len(extracted_past_key_values)}"
+            )
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
