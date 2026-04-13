@@ -586,6 +586,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Speculative decoding runtime config (set via speculative_config.load_spec_config)
+        # None = disabled (standard inference)
+        self.spec_config = None
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -818,7 +822,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         num_steps=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+        """Do a full inference forward and compute the action.
+
+        Speculative decoding is controlled by self.spec_config (set at runtime).
+        Set self.spec_config = load_spec_config(SpeculativeConfig(...)) to enable,
+        or self.spec_config = None to use standard inference (default).
+        """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -854,6 +863,133 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         dt = -1.0 / num_steps
 
         x_t = noise
+
+        # ── Speculative decoding path ──────────────────────────────────────
+        speculative_draft_head = self.spec_config  # None = disabled
+        if speculative_draft_head is not None and not self._rtc_enabled():
+            draft_model   = speculative_draft_head["model"]       # None for naive
+            draft_ns      = speculative_draft_head["norm_stats"]  # None for naive
+            spec_method    = speculative_draft_head.get("method", "mlp_scheme_g")
+            spec_K         = speculative_draft_head.get("K", 3)
+            spec_threshold = speculative_draft_head.get("threshold", 0.1)
+            chunk_size     = self.config.chunk_size
+
+            expert_layers  = self.paligemma_with_expert.gemma_expert.model.layers
+            last_layer_idx = len(expert_layers) - 1
+
+            # MLP norm stats (only used for mlp_scheme_g)
+            if draft_ns is not None:
+                h_mean = draft_ns["h_mean"]
+                h_std  = draft_ns["h_std"]
+                v_mean = draft_ns["v_mean"]
+                v_std  = draft_ns["v_std"]
+
+            last_hs = None
+            last_vt = None  # for naive_scheme_g
+            step    = 0
+
+            # Register hook once outside the loop (mlp methods need hidden states)
+            captured = {}
+            if spec_method in ("mlp_scheme_g", "mlp_no_verify"):
+                def _hook(module, inp, out):  # noqa: E306
+                    hs = out[0] if isinstance(out, tuple) else out
+                    captured["hs"] = hs[:, -chunk_size:]
+                _hook_handle = expert_layers[last_layer_idx].register_forward_hook(_hook)
+            else:
+                _hook_handle = None
+
+            while step < num_steps:
+                time        = 1.0 + step * dt
+                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+                # ── mlp_no_verify: skip K-1 steps with MLP, run target every K steps ──
+                if spec_method == "mlp_no_verify" and last_hs is not None and step + spec_K <= num_steps:
+                    B, S, H = last_hs.shape
+                    _, _, A = x_t.shape
+                    # Run K-1 MLP draft steps (no target forward)
+                    for k in range(spec_K - 1):
+                        t_k    = 1.0 + (step + k) * dt
+                        h_norm = (last_hs.reshape(B * S, H) - h_mean) / h_std
+                        x_flat = x_t.reshape(B * S, A)
+                        t_flat = torch.full((B * S, 1), t_k, device=device)
+                        inp    = torch.cat([h_norm, x_flat, t_flat], dim=-1)
+                        v_k    = (draft_model(inp) * v_std + v_mean).reshape(B, S, A)
+                        x_t    = x_t + dt * v_k
+                    # Run 1 target forward at step+K-1 to update h_last
+                    t_last      = 1.0 + (step + spec_K - 1) * dt
+                    t_last_tens = torch.tensor(t_last, dtype=torch.float32, device=device).expand(bsize)
+                    captured.clear()
+                    v_t = self.denoise_step(
+                        state=state, prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values, x_t=x_t, timestep=t_last_tens,
+                    )
+                    x_t     = x_t + dt * v_t
+                    last_hs = captured.get("hs")
+                    last_vt = v_t
+                    step   += spec_K
+                    continue
+
+                # ── mlp_scheme_g / naive_scheme_g: draft + verify ──
+                can_draft = step + spec_K <= num_steps
+                if spec_method == "mlp_scheme_g":
+                    can_draft = can_draft and last_hs is not None
+                elif spec_method == "naive_scheme_g":
+                    can_draft = can_draft and last_vt is not None
+
+                if can_draft:
+                    if spec_method == "mlp_scheme_g":
+                        B, S, H = last_hs.shape
+                        _, _, A = x_t.shape
+                        h_norm  = (last_hs.reshape(B * S, H) - h_mean) / h_std
+                        x_flat  = x_t.reshape(B * S, A)
+                        t_flat  = torch.full((B * S, 1), time, device=device)
+                        inp     = torch.cat([h_norm, x_flat, t_flat], dim=-1)
+                        v_draft = (draft_model(inp) * v_std + v_mean).reshape(B, S, A)
+                    else:
+                        v_draft = last_vt
+
+                    x_draft_K = x_t + spec_K * dt * v_draft
+
+                    captured.clear()
+                    v_target = self.denoise_step(
+                        state=state, prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values, x_t=x_t, timestep=time_tensor,
+                    )
+
+                    x_target_K = x_t + spec_K * dt * v_target
+                    rel_err = (
+                        (x_draft_K - x_target_K).norm(dim=-1)
+                        / x_target_K.norm(dim=-1).clamp(min=1e-6)
+                    ).mean().item()
+
+                    if rel_err < spec_threshold:
+                        x_t     = x_draft_K
+                        last_hs = captured.get("hs")
+                        last_vt = v_draft
+                        step   += spec_K
+                    else:
+                        x_t     = x_t + dt * v_target
+                        last_hs = captured.get("hs")
+                        last_vt = v_target
+                        step   += 1
+                else:
+                    # Normal target forward (first step or near end)
+                    captured.clear()
+                    v_t = self.denoise_step(
+                        state=state, prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values, x_t=x_t, timestep=time_tensor,
+                    )
+                    last_hs = captured.get("hs")
+                    last_vt = v_t
+                    x_t     = x_t + dt * v_t
+                    step   += 1
+
+            if _hook_handle is not None:
+                _hook_handle.remove()
+
+            return x_t
+        # ── End speculative path ───────────────────────────────────────────
+
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
