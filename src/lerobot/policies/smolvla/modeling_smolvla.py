@@ -63,6 +63,7 @@ from torch import Tensor, nn
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.option_b_runtime import load_option_b_runtime
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
@@ -564,6 +565,7 @@ class VLAFlowMatching(nn.Module):
         self.last_prefix_pad_masks: torch.Tensor | None = None
         self.last_past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.last_past_key_values_debug: str = ""
+        self.option_b_runtime = None
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -602,6 +604,12 @@ class VLAFlowMatching(nn.Module):
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
 
+        if self.config.option_b_draft_path is not None:
+            self.option_b_runtime = load_option_b_runtime(
+                draft_path=self.config.option_b_draft_path,
+                norm_stats_path=self.config.option_b_norm_stats_path,
+            )
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -610,6 +618,20 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _get_option_b_runtime(self, device: torch.device):
+        if self.option_b_runtime is None:
+            return None
+
+        device_str = str(device)
+        if self.option_b_runtime.get("device") != device_str:
+            self.option_b_runtime["model"] = self.option_b_runtime["model"].to(device).eval()
+            self.option_b_runtime["norm_stats"] = {
+                key: value.to(device=device, dtype=torch.float32)
+                for key, value in self.option_b_runtime["norm_stats"].items()
+            }
+            self.option_b_runtime["device"] = device_str
+        return self.option_b_runtime
 
     def set_debug_velocity_trace(self, enabled: bool) -> None:
         self.debug_collect_velocity_trace = enabled
@@ -892,6 +914,16 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+
+        option_b_runtime = self._get_option_b_runtime(device)
+        if option_b_runtime is not None and not self._rtc_enabled():
+            return self._sample_actions_option_b(
+                noise=noise,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                runtime=option_b_runtime,
+            )
+
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -952,6 +984,88 @@ class VLAFlowMatching(nn.Module):
             self.last_final_action = x_t.detach().to("cpu")
 
         return x_t
+
+    def _sample_actions_option_b(
+        self,
+        *,
+        noise: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+        runtime: dict,
+    ) -> Tensor:
+        device = noise.device
+        batch_size = noise.shape[0]
+
+        time_tensor = torch.ones(batch_size, dtype=torch.float32, device=device)
+        x0 = noise
+        v1 = self.denoise_step(
+            x_t=x0,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            timestep=time_tensor,
+        )
+
+        extracted_past_key_values = self._extract_legacy_past_key_values(past_key_values)
+        if len(extracted_past_key_values) == 0:
+            return x0 - v1
+
+        kv_cache_k = torch.stack([layer_k for layer_k, _ in extracted_past_key_values], dim=1)
+        kv_cache_v = torch.stack([layer_v for _, layer_v in extracted_past_key_values], dim=1)
+
+        norm_stats = runtime["norm_stats"]
+        model = runtime["model"]
+        state_dim = self.config.chunk_size * self.config.max_action_dim
+
+        state_features = torch.cat(
+            [
+                x0.reshape(batch_size, -1),
+                v1.reshape(batch_size, -1),
+                time_tensor[:, None],
+            ],
+            dim=-1,
+        )
+        state_norm = (state_features - norm_stats["state_mean"]) / norm_stats["state_std"].clamp(min=1e-6)
+        x0_norm = state_norm[:, :state_dim].reshape(-1, self.config.chunk_size, self.config.max_action_dim)
+        v1_norm = state_norm[:, state_dim : 2 * state_dim].reshape(
+            -1, self.config.chunk_size, self.config.max_action_dim
+        )
+        t1_norm = state_norm[:, -1:].reshape(-1, 1)
+
+        amp_enabled = device.type == "cuda"
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            pred_residual_norm = model(
+                x0=x0_norm,
+                v1=v1_norm,
+                t1=t1_norm,
+                prefix_pad_masks=prefix_pad_masks,
+                kv_cache_k=kv_cache_k,
+                kv_cache_v=kv_cache_v,
+            )
+        pred_residual_norm = pred_residual_norm.to(dtype=torch.float32)
+
+        pred_flat = pred_residual_norm.reshape(batch_size, -1)
+        pred_residual = (
+            pred_flat * norm_stats["target_std"] + norm_stats["target_mean"]
+        ).reshape_as(pred_residual_norm)
+
+        x_linear = x0 - v1
+        x_final = x_linear + pred_residual
+
+        if self.debug_collect_velocity_trace:
+            self.clear_debug_velocity_trace()
+            self.last_prefix_pad_masks = prefix_pad_masks.detach().to("cpu")
+            self.last_past_key_values = [
+                (k.detach().to("cpu"), v.detach().to("cpu")) for k, v in extracted_past_key_values
+            ]
+            self.last_past_key_values_debug = (
+                f"option_b extracted_layers={len(extracted_past_key_values)}"
+            )
+            self.last_xt_trace = [x0.detach().to("cpu"), x_final.detach().to("cpu")]
+            self.last_velocity_trace = [v1.detach().to("cpu")]
+            self.last_velocity_trace_times = [1.0]
+            self.last_final_action = x_final.detach().to("cpu")
+
+        return x_final
 
     def denoise_step(
         self,

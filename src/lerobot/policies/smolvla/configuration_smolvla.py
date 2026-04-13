@@ -109,6 +109,10 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # Optional one-shot draft runtime for speculative denoising research.
+    option_b_draft_path: str | None = None
+    option_b_norm_stats_path: str | None = None
+
     def __post_init__(self):
         super().__post_init__()
 

@@ -67,6 +67,8 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Number of rollout episodes to render as videos during evaluation.
+    max_episodes_rendered: int = 10
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:
