@@ -113,6 +113,14 @@ class SmolVLAConfig(PreTrainedConfig):
     option_b_draft_path: str | None = None
     option_b_norm_stats_path: str | None = None
 
+    # Optional two-stage draft runtime:
+    # target step1 -> draft(x1->x_split) -> target -> draft(x_split+1->x_final)
+    option_b_stage1_draft_path: str | None = None
+    option_b_stage1_norm_stats_path: str | None = None
+    option_b_stage2_draft_path: str | None = None
+    option_b_stage2_norm_stats_path: str | None = None
+    option_b_two_stage_split_step: int = 5
+
     def __post_init__(self):
         super().__post_init__()
 

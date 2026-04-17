@@ -566,6 +566,8 @@ class VLAFlowMatching(nn.Module):
         self.last_past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.last_past_key_values_debug: str = ""
         self.option_b_runtime = None
+        self.option_b_stage1_runtime = None
+        self.option_b_stage2_runtime = None
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -609,6 +611,16 @@ class VLAFlowMatching(nn.Module):
                 draft_path=self.config.option_b_draft_path,
                 norm_stats_path=self.config.option_b_norm_stats_path,
             )
+        if self.config.option_b_stage1_draft_path is not None:
+            self.option_b_stage1_runtime = load_option_b_runtime(
+                draft_path=self.config.option_b_stage1_draft_path,
+                norm_stats_path=self.config.option_b_stage1_norm_stats_path,
+            )
+        if self.config.option_b_stage2_draft_path is not None:
+            self.option_b_stage2_runtime = load_option_b_runtime(
+                draft_path=self.config.option_b_stage2_draft_path,
+                norm_stats_path=self.config.option_b_stage2_norm_stats_path,
+            )
 
         # Compile model if requested
         if config.compile_model:
@@ -622,16 +634,27 @@ class VLAFlowMatching(nn.Module):
     def _get_option_b_runtime(self, device: torch.device):
         if self.option_b_runtime is None:
             return None
+        return self._move_option_b_runtime_to_device(self.option_b_runtime, device)
 
+    def _get_option_b_two_stage_runtimes(self, device: torch.device):
+        if self.option_b_stage1_runtime is None or self.option_b_stage2_runtime is None:
+            return None
+        return (
+            self._move_option_b_runtime_to_device(self.option_b_stage1_runtime, device),
+            self._move_option_b_runtime_to_device(self.option_b_stage2_runtime, device),
+        )
+
+    @staticmethod
+    def _move_option_b_runtime_to_device(runtime: dict, device: torch.device):
         device_str = str(device)
-        if self.option_b_runtime.get("device") != device_str:
-            self.option_b_runtime["model"] = self.option_b_runtime["model"].to(device).eval()
-            self.option_b_runtime["norm_stats"] = {
+        if runtime.get("device") != device_str:
+            runtime["model"] = runtime["model"].to(device).eval()
+            runtime["norm_stats"] = {
                 key: value.to(device=device, dtype=torch.float32)
-                for key, value in self.option_b_runtime["norm_stats"].items()
+                for key, value in runtime["norm_stats"].items()
             }
-            self.option_b_runtime["device"] = device_str
-        return self.option_b_runtime
+            runtime["device"] = device_str
+        return runtime
 
     def set_debug_velocity_trace(self, enabled: bool) -> None:
         self.debug_collect_velocity_trace = enabled
@@ -915,7 +938,15 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=True,
         )
 
+        option_b_two_stage_runtimes = self._get_option_b_two_stage_runtimes(device)
         option_b_runtime = self._get_option_b_runtime(device)
+        if option_b_two_stage_runtimes is not None and not self._rtc_enabled():
+            return self._sample_actions_option_b_two_stage(
+                noise=noise,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                runtimes=option_b_two_stage_runtimes,
+            )
         if option_b_runtime is not None and not self._rtc_enabled():
             return self._sample_actions_option_b(
                 noise=noise,
@@ -985,6 +1016,59 @@ class VLAFlowMatching(nn.Module):
 
         return x_t
 
+    def _predict_option_b_block(
+        self,
+        *,
+        runtime: dict,
+        x_start: torch.Tensor,
+        v_anchor: torch.Tensor,
+        time_value: float,
+        linear_steps: int,
+        prefix_pad_masks: torch.Tensor,
+        kv_cache_k: torch.Tensor,
+        kv_cache_v: torch.Tensor,
+    ) -> Tensor:
+        batch_size = x_start.shape[0]
+        norm_stats = runtime["norm_stats"]
+        model = runtime["model"]
+        state_dim = self.config.chunk_size * self.config.max_action_dim
+        time_tensor = torch.full((batch_size,), float(time_value), dtype=torch.float32, device=x_start.device)
+
+        state_features = torch.cat(
+            [
+                x_start.reshape(batch_size, -1),
+                v_anchor.reshape(batch_size, -1),
+                time_tensor[:, None],
+            ],
+            dim=-1,
+        )
+        state_norm = (state_features - norm_stats["state_mean"]) / norm_stats["state_std"].clamp(min=1e-6)
+        x0_norm = state_norm[:, :state_dim].reshape(-1, self.config.chunk_size, self.config.max_action_dim)
+        v1_norm = state_norm[:, state_dim : 2 * state_dim].reshape(
+            -1, self.config.chunk_size, self.config.max_action_dim
+        )
+        t1_norm = state_norm[:, -1:].reshape(-1, 1)
+
+        amp_enabled = x_start.device.type == "cuda"
+        with torch.autocast(device_type=x_start.device.type, dtype=torch.float16, enabled=amp_enabled):
+            pred_residual_norm = model(
+                x0=x0_norm,
+                v1=v1_norm,
+                t1=t1_norm,
+                prefix_pad_masks=prefix_pad_masks,
+                kv_cache_k=kv_cache_k,
+                kv_cache_v=kv_cache_v,
+            )
+        pred_residual_norm = pred_residual_norm.to(dtype=torch.float32)
+        pred_flat = pred_residual_norm.reshape(batch_size, -1)
+        pred_residual = (
+            pred_flat * norm_stats["target_std"] + norm_stats["target_mean"]
+        ).reshape_as(pred_residual_norm)
+
+        dt = -1.0 / self.config.num_steps
+        x_linear = x_start + (linear_steps * dt) * v_anchor
+        return x_linear + pred_residual
+
     def _sample_actions_option_b(
         self,
         *,
@@ -1013,43 +1097,16 @@ class VLAFlowMatching(nn.Module):
         kv_cache_v = torch.stack([layer_v for _, layer_v in extracted_past_key_values], dim=1)
 
         norm_stats = runtime["norm_stats"]
-        model = runtime["model"]
-        state_dim = self.config.chunk_size * self.config.max_action_dim
-
-        state_features = torch.cat(
-            [
-                x0.reshape(batch_size, -1),
-                v1.reshape(batch_size, -1),
-                time_tensor[:, None],
-            ],
-            dim=-1,
+        x_final = self._predict_option_b_block(
+            runtime=runtime,
+            x_start=x0,
+            v_anchor=v1,
+            time_value=1.0,
+            linear_steps=self.config.num_steps,
+            prefix_pad_masks=prefix_pad_masks,
+            kv_cache_k=kv_cache_k,
+            kv_cache_v=kv_cache_v,
         )
-        state_norm = (state_features - norm_stats["state_mean"]) / norm_stats["state_std"].clamp(min=1e-6)
-        x0_norm = state_norm[:, :state_dim].reshape(-1, self.config.chunk_size, self.config.max_action_dim)
-        v1_norm = state_norm[:, state_dim : 2 * state_dim].reshape(
-            -1, self.config.chunk_size, self.config.max_action_dim
-        )
-        t1_norm = state_norm[:, -1:].reshape(-1, 1)
-
-        amp_enabled = device.type == "cuda"
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            pred_residual_norm = model(
-                x0=x0_norm,
-                v1=v1_norm,
-                t1=t1_norm,
-                prefix_pad_masks=prefix_pad_masks,
-                kv_cache_k=kv_cache_k,
-                kv_cache_v=kv_cache_v,
-            )
-        pred_residual_norm = pred_residual_norm.to(dtype=torch.float32)
-
-        pred_flat = pred_residual_norm.reshape(batch_size, -1)
-        pred_residual = (
-            pred_flat * norm_stats["target_std"] + norm_stats["target_mean"]
-        ).reshape_as(pred_residual_norm)
-
-        x_linear = x0 - v1
-        x_final = x_linear + pred_residual
 
         if self.debug_collect_velocity_trace:
             self.clear_debug_velocity_trace()
@@ -1063,6 +1120,96 @@ class VLAFlowMatching(nn.Module):
             self.last_xt_trace = [x0.detach().to("cpu"), x_final.detach().to("cpu")]
             self.last_velocity_trace = [v1.detach().to("cpu")]
             self.last_velocity_trace_times = [1.0]
+            self.last_final_action = x_final.detach().to("cpu")
+
+        return x_final
+
+    def _sample_actions_option_b_two_stage(
+        self,
+        *,
+        noise: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+        runtimes: tuple[dict, dict],
+    ) -> Tensor:
+        device = noise.device
+        batch_size = noise.shape[0]
+        split_step = int(self.config.option_b_two_stage_split_step)
+        num_steps = int(self.config.num_steps)
+        if split_step <= 1 or split_step >= num_steps - 1:
+            raise ValueError(
+                f"option_b_two_stage_split_step must be in [2, {num_steps - 2}], got {split_step}"
+            )
+
+        time_first = torch.ones(batch_size, dtype=torch.float32, device=device)
+        x0 = noise
+        v1 = self.denoise_step(
+            x_t=x0,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            timestep=time_first,
+        )
+        dt = -1.0 / num_steps
+        x1 = x0 + dt * v1
+
+        extracted_past_key_values = self._extract_legacy_past_key_values(past_key_values)
+        if len(extracted_past_key_values) == 0:
+            return x1
+
+        kv_cache_k = torch.stack([layer_k for layer_k, _ in extracted_past_key_values], dim=1)
+        kv_cache_v = torch.stack([layer_v for _, layer_v in extracted_past_key_values], dim=1)
+
+        stage1_runtime, stage2_runtime = runtimes
+        x_split = self._predict_option_b_block(
+            runtime=stage1_runtime,
+            x_start=x1,
+            v_anchor=v1,
+            time_value=1.0 + dt,
+            linear_steps=split_step - 1,
+            prefix_pad_masks=prefix_pad_masks,
+            kv_cache_k=kv_cache_k,
+            kv_cache_v=kv_cache_v,
+        )
+
+        mid_time_value = 1.0 + split_step * dt
+        mid_time = torch.full((batch_size,), float(mid_time_value), dtype=torch.float32, device=device)
+        v_mid = self.denoise_step(
+            x_t=x_split,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            timestep=mid_time,
+        )
+        x_after_mid = x_split + dt * v_mid
+
+        x_final = self._predict_option_b_block(
+            runtime=stage2_runtime,
+            x_start=x_after_mid,
+            v_anchor=v_mid,
+            time_value=mid_time_value + dt,
+            linear_steps=num_steps - split_step - 1,
+            prefix_pad_masks=prefix_pad_masks,
+            kv_cache_k=kv_cache_k,
+            kv_cache_v=kv_cache_v,
+        )
+
+        if self.debug_collect_velocity_trace:
+            self.clear_debug_velocity_trace()
+            self.last_prefix_pad_masks = prefix_pad_masks.detach().to("cpu")
+            self.last_past_key_values = [
+                (k.detach().to("cpu"), v.detach().to("cpu")) for k, v in extracted_past_key_values
+            ]
+            self.last_past_key_values_debug = (
+                f"option_b_two_stage extracted_layers={len(extracted_past_key_values)} split={split_step}"
+            )
+            self.last_xt_trace = [
+                x0.detach().to("cpu"),
+                x1.detach().to("cpu"),
+                x_split.detach().to("cpu"),
+                x_after_mid.detach().to("cpu"),
+                x_final.detach().to("cpu"),
+            ]
+            self.last_velocity_trace = [v1.detach().to("cpu"), v_mid.detach().to("cpu")]
+            self.last_velocity_trace_times = [1.0, float(mid_time_value)]
             self.last_final_action = x_final.detach().to("cpu")
 
         return x_final
