@@ -53,6 +53,10 @@ class PI05Config(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # Option-B draft correction
+    option_b_draft_path: str | None = None
+    option_b_norm_stats_path: str | None = None
+
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
         DEFAULT_IMAGE_SIZE,

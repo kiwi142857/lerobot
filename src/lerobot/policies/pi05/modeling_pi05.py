@@ -586,12 +586,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # None = disabled (standard inference)
         self.spec_config = None
 
+        # Option-B draft correction runtime
+        self.option_b_runtime = None
+
+        # Debug trace for teacher trajectory collection
+        self._debug_trace_enabled = False
+        self.last_xt_trace = []
+        self.last_vt_trace = []
+        self.last_time_trace = []
+        self.last_past_key_values = None
+        self.last_final_action = None
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
+    def set_debug_trace(self, enabled: bool) -> None:
+        self._debug_trace_enabled = enabled
+
+    def clear_debug_trace(self) -> None:
+        self.last_xt_trace = []
+        self.last_vt_trace = []
+        self.last_time_trace = []
+        self.last_past_key_values = None
+        self.last_final_action = None
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -836,6 +857,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         x_t = noise
 
+        # Record past_key_values for debug trace
+        if self._debug_trace_enabled:
+            self.last_past_key_values = past_key_values
+            self.last_prefix_pad_masks = prefix_pad_masks
+            self.last_xt_trace = [x_t.detach().clone()]
+            self.last_vt_trace = []
+            self.last_time_trace = []
+
         # ── Speculative decoding path ──────────────────────────────────────
         speculative_draft_head = self.spec_config  # None = disabled
         if speculative_draft_head is not None and not self._rtc_enabled():
@@ -934,6 +963,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return x_t
         # ── End speculative path ───────────────────────────────────────────
 
+        # ── Option-B draft correction path ────────────────────────────────
+        if self.option_b_runtime is not None and not self._rtc_enabled():
+            return self._sample_actions_option_b(
+                noise=x_t,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                runtime=self.option_b_runtime,
+                num_steps=num_steps,
+                dt=dt,
+            )
+        # ── End option-b path ─────────────────────────────────────────────
+
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -964,10 +1005,86 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             x_t = x_t + dt * v_t
 
+            if self._debug_trace_enabled:
+                self.last_vt_trace.append(v_t.detach().clone())
+                self.last_time_trace.append(float(time))
+                self.last_xt_trace.append(x_t.detach().clone())
+
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        if self._debug_trace_enabled:
+            self.last_final_action = x_t.detach().clone()
+
         return x_t
+
+    def _sample_actions_option_b(
+        self,
+        *,
+        noise: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+        runtime: dict,
+        num_steps: int,
+        dt: float,
+    ) -> torch.Tensor:
+        device = noise.device
+        batch_size = noise.shape[0]
+
+        time_tensor = torch.ones(batch_size, dtype=torch.float32, device=device)
+        x0 = noise
+        v1 = self.denoise_step(
+            x_t=x0,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            timestep=time_tensor,
+        )
+
+        # Extract KV cache: DynamicCache -> (B, n_layers, seq_len, head_dim) after squeeze
+        kv_k = torch.stack(
+            [past_key_values.layers[i].keys for i in range(len(past_key_values.layers))], dim=1
+        )  # (B, n_layers, n_heads, seq_len, head_dim)
+        kv_v = torch.stack(
+            [past_key_values.layers[i].values for i in range(len(past_key_values.layers))], dim=1
+        )
+        # Pi05 has n_heads=1 for the action expert layers; squeeze to (B, n_layers, seq_len, head_dim)
+        if kv_k.ndim == 5 and kv_k.shape[2] == 1:
+            kv_k = kv_k.squeeze(2)
+            kv_v = kv_v.squeeze(2)
+
+        norm_stats = runtime["norm_stats"]
+        model = runtime["model"]
+        state_dim = self.config.chunk_size * self.config.max_action_dim
+
+        state_features = torch.cat(
+            [x0.reshape(batch_size, -1), v1.reshape(batch_size, -1),
+             torch.ones(batch_size, 1, dtype=torch.float32, device=device)],
+            dim=-1,
+        )
+        state_norm = (state_features - norm_stats["state_mean"].to(device)) / norm_stats["state_std"].to(device).clamp(min=1e-6)
+        x0_norm = state_norm[:, :state_dim].reshape(batch_size, self.config.chunk_size, self.config.max_action_dim)
+        v1_norm = state_norm[:, state_dim:2 * state_dim].reshape(batch_size, self.config.chunk_size, self.config.max_action_dim)
+        t1_norm = state_norm[:, -1:].reshape(batch_size, 1)
+
+        model = model.to(device)
+        amp_enabled = device.type == "cuda"
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            pred_residual_norm = model(
+                x0=x0_norm,
+                v1=v1_norm,
+                t1=t1_norm,
+                prefix_pad_masks=prefix_pad_masks,
+                kv_cache_k=kv_k,
+                kv_cache_v=kv_v,
+            )
+        pred_residual_norm = pred_residual_norm.to(dtype=torch.float32)
+        pred_flat = pred_residual_norm.reshape(batch_size, -1)
+        pred_residual = (
+            pred_flat * norm_stats["target_std"].to(device) + norm_stats["target_mean"].to(device)
+        ).reshape_as(pred_residual_norm)
+
+        x_linear = x0 + (num_steps * dt) * v1
+        return x_linear + pred_residual
 
     def denoise_step(
         self,
@@ -1037,6 +1154,14 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+
+        # Load option_b runtime if configured
+        if config.option_b_draft_path is not None:
+            from lerobot.policies.smolvla.option_b_runtime import load_option_b_runtime
+            self.model.option_b_runtime = load_option_b_runtime(
+                draft_path=config.option_b_draft_path,
+                norm_stats_path=config.option_b_norm_stats_path,
+            )
 
         self.reset()
 
