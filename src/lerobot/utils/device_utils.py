@@ -18,12 +18,41 @@ import logging
 
 import torch
 
+_TORCH_NPU_IMPORT_ATTEMPTED = False
+_TORCH_NPU_AVAILABLE = False
+
+
+def maybe_import_torch_npu() -> bool:
+    """Import torch_npu on demand so that torch.device("npu") is registered."""
+    global _TORCH_NPU_IMPORT_ATTEMPTED, _TORCH_NPU_AVAILABLE
+    if not _TORCH_NPU_IMPORT_ATTEMPTED:
+        _TORCH_NPU_IMPORT_ATTEMPTED = True
+        try:
+            import torch_npu  # noqa: F401
+
+            if hasattr(torch, "npu") and hasattr(torch.npu, "set_compile_mode"):
+                torch.npu.set_compile_mode(jit_compile=False)
+            _TORCH_NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+        except ImportError:
+            _TORCH_NPU_AVAILABLE = False
+        except Exception as exc:  # pragma: no cover - depends on local CANN runtime
+            logging.warning("torch_npu import failed: %s", exc)
+            _TORCH_NPU_AVAILABLE = False
+    return _TORCH_NPU_AVAILABLE
+
+
+def is_torch_npu_available() -> bool:
+    return maybe_import_torch_npu()
+
 
 def auto_select_torch_device() -> torch.device:
     """Tries to select automatically a torch device."""
     if torch.cuda.is_available():
         logging.info("Cuda backend detected, using cuda.")
         return torch.device("cuda")
+    elif is_torch_npu_available():
+        logging.info("Ascend NPU backend detected, using npu.")
+        return torch.device("npu")
     elif torch.backends.mps.is_available():
         logging.info("Metal backend detected, using mps.")
         return torch.device("mps")
@@ -41,6 +70,9 @@ def get_safe_torch_device(try_device: str, log: bool = False) -> torch.device:
     try_device = str(try_device)
     if try_device.startswith("cuda"):
         assert torch.cuda.is_available()
+        device = torch.device(try_device)
+    elif try_device.startswith("npu"):
+        assert is_torch_npu_available()
         device = torch.device(try_device)
     elif try_device == "mps":
         assert torch.backends.mps.is_available()
@@ -65,6 +97,13 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
     """
     if isinstance(device, torch.device):
         device = device.type
+    if device == "npu":
+        if dtype == torch.float64:
+            logging.warning("Ascend NPU does not support float64 reliably, using float32 instead.")
+            return torch.float32
+        if dtype == torch.bfloat16:
+            logging.warning("Ascend 310P NPU path uses float16 instead of bfloat16.")
+            return torch.float16
     if device == "mps" and dtype == torch.float64:
         return torch.float32
     if device == "xpu" and dtype == torch.float64:
@@ -90,6 +129,8 @@ def is_torch_device_available(try_device: str) -> bool:
     try_device = str(try_device)  # Ensure try_device is a string
     if try_device.startswith("cuda"):
         return torch.cuda.is_available()
+    elif try_device.startswith("npu"):
+        return is_torch_npu_available()
     elif try_device == "mps":
         return torch.backends.mps.is_available()
     elif try_device == "xpu":
@@ -97,13 +138,26 @@ def is_torch_device_available(try_device: str) -> bool:
     elif try_device == "cpu":
         return True
     else:
-        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu or cpu.")
+        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, npu, mps, xpu or cpu.")
 
 
 def is_amp_available(device: str):
-    if device in ["cuda", "xpu", "cpu"]:
+    if device in ["cuda", "npu", "xpu", "cpu"]:
         return True
     elif device == "mps":
         return False
     else:
         raise ValueError(f"Unknown device '{device}.")
+
+
+def synchronize_torch_device(device: str | torch.device) -> None:
+    if isinstance(device, str):
+        device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "npu" and hasattr(torch, "npu"):
+        torch.npu.synchronize()
+    elif device.type == "xpu":
+        torch.xpu.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()

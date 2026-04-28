@@ -54,7 +54,9 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
-from typing import TypedDict, Unpack
+from typing import TypedDict
+
+from typing_extensions import Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -91,6 +93,7 @@ def create_sinusoidal_pos_embedding(
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
+    time = time.to(dtype=dtype)
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
@@ -714,19 +717,24 @@ class VLAFlowMatching(nn.Module):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
 
+    def _inference_dtype(self, device: torch.device | str | None = None) -> torch.dtype:
+        if device is not None and torch.device(device).type == "npu":
+            return self.action_in_proj.weight.dtype
+        return torch.float32
+
     def sample_noise(self, shape, device):
         noise = torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
-            dtype=torch.float32,
+            dtype=self._inference_dtype(device),
             device=device,
         )
         return noise
 
     def sample_time(self, bsize, device):
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
-        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=self._inference_dtype(device))
         time = time_beta * 0.999 + 0.001
         return time
 
@@ -900,7 +908,7 @@ class VLAFlowMatching(nn.Module):
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self._inference_dtype(suffix_out.device))
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
@@ -959,6 +967,7 @@ class VLAFlowMatching(nn.Module):
         dt = -1.0 / num_steps
 
         x_t = noise
+        run_dtype = self._inference_dtype(device)
         if self.debug_collect_velocity_trace:
             self.clear_debug_velocity_trace()
             extracted_past_key_values = self._extract_legacy_past_key_values(past_key_values)
@@ -972,7 +981,7 @@ class VLAFlowMatching(nn.Module):
             )
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_tensor = torch.tensor(time, dtype=run_dtype, device=device).expand(bsize)
 
             if self.debug_collect_velocity_trace:
                 self.last_xt_trace.append(x_t.detach().to("cpu"))
@@ -1032,7 +1041,8 @@ class VLAFlowMatching(nn.Module):
         norm_stats = runtime["norm_stats"]
         model = runtime["model"]
         state_dim = self.config.chunk_size * self.config.max_action_dim
-        time_tensor = torch.full((batch_size,), float(time_value), dtype=torch.float32, device=x_start.device)
+        run_dtype = self._inference_dtype(x_start.device)
+        time_tensor = torch.full((batch_size,), float(time_value), dtype=run_dtype, device=x_start.device)
 
         state_features = torch.cat(
             [
@@ -1049,7 +1059,7 @@ class VLAFlowMatching(nn.Module):
         )
         t1_norm = state_norm[:, -1:].reshape(-1, 1)
 
-        amp_enabled = x_start.device.type == "cuda"
+        amp_enabled = x_start.device.type in ("cuda", "npu")
         with torch.autocast(device_type=x_start.device.type, dtype=torch.float16, enabled=amp_enabled):
             pred_residual_norm = model(
                 x0=x0_norm,
@@ -1080,7 +1090,7 @@ class VLAFlowMatching(nn.Module):
         device = noise.device
         batch_size = noise.shape[0]
 
-        time_tensor = torch.ones(batch_size, dtype=torch.float32, device=device)
+        time_tensor = torch.ones(batch_size, dtype=self._inference_dtype(device), device=device)
         x0 = noise
         v1 = self.denoise_step(
             x_t=x0,
@@ -1141,7 +1151,8 @@ class VLAFlowMatching(nn.Module):
                 f"option_b_two_stage_split_step must be in [2, {num_steps - 2}], got {split_step}"
             )
 
-        time_first = torch.ones(batch_size, dtype=torch.float32, device=device)
+        run_dtype = self._inference_dtype(device)
+        time_first = torch.ones(batch_size, dtype=run_dtype, device=device)
         x0 = noise
         v1 = self.denoise_step(
             x_t=x0,
@@ -1172,7 +1183,7 @@ class VLAFlowMatching(nn.Module):
         )
 
         mid_time_value = 1.0 + split_step * dt
-        mid_time = torch.full((batch_size,), float(mid_time_value), dtype=torch.float32, device=device)
+        mid_time = torch.full((batch_size,), float(mid_time_value), dtype=run_dtype, device=device)
         v_mid = self.denoise_step(
             x_t=x_split,
             prefix_pad_masks=prefix_pad_masks,
@@ -1245,6 +1256,6 @@ class VLAFlowMatching(nn.Module):
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self._inference_dtype(suffix_out.device))
         v_t = self.action_out_proj(suffix_out)
         return v_t

@@ -20,7 +20,9 @@ import logging
 import math
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+from typing_extensions import Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -71,6 +73,8 @@ def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
         return torch.float32
+    if device_type == "npu" and target_dtype == torch.float64:
+        return torch.float32
     if device_type == "cpu":
         # CPU doesn't support bfloat16, use float32 instead
         if target_dtype == torch.bfloat16:
@@ -93,6 +97,7 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
+    time = time.to(dtype=dtype)
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
@@ -629,21 +634,28 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
+    def _inference_dtype(self, device: torch.device | str | None = None) -> torch.dtype:
+        if device is not None and torch.device(device).type == "npu":
+            return self.action_in_proj.weight.dtype
+        return torch.float32
+
     def sample_noise(self, shape, device):
+        dtype = self._inference_dtype(device)
         return torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
 
     def sample_time(self, bsize, device):
+        dtype = self._inference_dtype(device)
         time_beta = sample_beta(
             self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
         )
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
-        return time.to(dtype=torch.float32, device=device)
+        return time.to(dtype=dtype, device=device)
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -784,6 +796,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        if prefix_embs.device.type == "npu":
+            att_2d_masks_4d = att_2d_masks_4d.to(dtype=self._inference_dtype(prefix_embs.device))
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
@@ -801,7 +815,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self._inference_dtype(suffix_out.device))
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
@@ -849,7 +863,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        run_dtype = self._inference_dtype(device)
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        if device.type == "npu":
+            prefix_att_2d_masks_4d = prefix_att_2d_masks_4d.to(dtype=run_dtype)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
@@ -900,7 +917,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             while step < num_steps:
                 time        = 1.0 + step * dt
-                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+                time_tensor = torch.tensor(time, dtype=run_dtype, device=device).expand(bsize)
 
                 # ── mlp_no_verify: skip K-1 steps with MLP, run target every K steps ──
                 if spec_method == "mlp_no_verify" and last_hs is not None and step + spec_K <= num_steps:
@@ -911,13 +928,13 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         t_k    = 1.0 + (step + k) * dt
                         h_norm = (last_hs.reshape(B * S, H) - h_mean) / h_std
                         x_flat = x_t.reshape(B * S, A)
-                        t_flat = torch.full((B * S, 1), t_k, device=device)
+                        t_flat = torch.full((B * S, 1), t_k, dtype=run_dtype, device=device)
                         inp    = torch.cat([h_norm, x_flat, t_flat], dim=-1)
                         v_k    = (draft_model(inp) * v_std + v_mean).reshape(B, S, A)
                         x_t    = x_t + dt * v_k
                     # Run 1 target forward at step+K-1 to update h_last
                     t_last      = 1.0 + (step + spec_K - 1) * dt
-                    t_last_tens = torch.tensor(t_last, dtype=torch.float32, device=device).expand(bsize)
+                    t_last_tens = torch.tensor(t_last, dtype=run_dtype, device=device).expand(bsize)
                     captured.clear()
                     v_t = self.denoise_step(
                         state=state, prefix_pad_masks=prefix_pad_masks,
@@ -942,7 +959,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         _, _, A = x_t.shape
                         h_norm  = (last_hs.reshape(B * S, H) - h_mean) / h_std
                         x_flat  = x_t.reshape(B * S, A)
-                        t_flat  = torch.full((B * S, 1), time, device=device)
+                        t_flat  = torch.full((B * S, 1), time, dtype=run_dtype, device=device)
                         inp     = torch.cat([h_norm, x_flat, t_flat], dim=-1)
                         v_draft = (draft_model(inp) * v_std + v_mean).reshape(B, S, A)
                     else:
@@ -992,7 +1009,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_tensor = torch.tensor(time, dtype=run_dtype, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -1049,6 +1066,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        if x_t.device.type == "npu":
+            full_att_2d_masks_4d = full_att_2d_masks_4d.to(dtype=self._inference_dtype(x_t.device))
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         past_key_values = copy.deepcopy(past_key_values)
@@ -1063,7 +1082,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self._inference_dtype(suffix_out.device))
         return self.action_out_proj(suffix_out)
 
 
