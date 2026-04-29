@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import builtins
-import copy
 import logging
 import math
 from collections import deque
@@ -440,12 +439,19 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
-        # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
+        vision_tower = self.paligemma.model.vision_tower
+        vision_dtype = next(vision_tower.parameters()).dtype
         out_dtype = image.dtype
-        if image.dtype != torch.float32:
-            image = image.to(torch.float32)
+        if image.dtype != vision_dtype:
+            image = image.to(vision_dtype)
         image_outputs = self.paligemma.model.get_image_features(image)
-        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        if isinstance(image_outputs, torch.Tensor):
+            features = image_outputs
+        elif hasattr(image_outputs, "pooler_output"):
+            features = image_outputs.pooler_output
+        else:
+            features = image_outputs.last_hidden_state
+        features = features * self.paligemma.config.text_config.hidden_size**0.5
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
@@ -637,6 +643,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    @staticmethod
+    def _move_option_b_runtime_to_device(runtime: dict, device: torch.device):
+        device_str = str(device)
+        if runtime.get("device") != device_str:
+            runtime["model"] = runtime["model"].to(device).eval()
+            runtime["norm_stats"] = {
+                key: value.to(device=device, dtype=torch.float32)
+                for key, value in runtime["norm_stats"].items()
+            }
+            runtime["device"] = device_str
+        return runtime
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -1045,8 +1063,39 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         num_steps: int,
         dt: float,
     ) -> torch.Tensor:
+        def _extract_kv_cache(cache):
+            if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+                pairs = [
+                    (key_tensor, value_tensor)
+                    for key_tensor, value_tensor in zip(cache.key_cache, cache.value_cache, strict=False)
+                    if torch.is_tensor(key_tensor) and torch.is_tensor(value_tensor)
+                ]
+                if pairs:
+                    return pairs
+            if hasattr(cache, "layers"):
+                return [
+                    (cache.layers[i].keys, cache.layers[i].values)
+                    for i in range(len(cache.layers))
+                    if torch.is_tensor(cache.layers[i].keys) and torch.is_tensor(cache.layers[i].values)
+                ]
+            if hasattr(cache, "to_legacy_cache"):
+                cache = cache.to_legacy_cache()
+            if isinstance(cache, tuple):
+                cache = list(cache)
+            if isinstance(cache, list):
+                return [
+                    (layer_cache[0], layer_cache[1])
+                    for layer_cache in cache
+                    if isinstance(layer_cache, (tuple, list))
+                    and len(layer_cache) >= 2
+                    and torch.is_tensor(layer_cache[0])
+                    and torch.is_tensor(layer_cache[1])
+                ]
+            return []
+
         device = noise.device
         batch_size = noise.shape[0]
+        runtime = self._move_option_b_runtime_to_device(runtime, device)
 
         run_dtype = self._inference_dtype(device)
         time_tensor = torch.ones(batch_size, dtype=run_dtype, device=device)
@@ -1058,13 +1107,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             timestep=time_tensor,
         )
 
-        # Extract KV cache: DynamicCache -> (B, n_layers, seq_len, head_dim) after squeeze
-        kv_k = torch.stack(
-            [past_key_values.layers[i].keys for i in range(len(past_key_values.layers))], dim=1
-        )  # (B, n_layers, n_heads, seq_len, head_dim)
-        kv_v = torch.stack(
-            [past_key_values.layers[i].values for i in range(len(past_key_values.layers))], dim=1
-        )
+        kv_pairs = _extract_kv_cache(past_key_values)
+        if not kv_pairs:
+            raise RuntimeError(f"Unable to extract KV cache from {type(past_key_values).__name__}")
+        kv_k = torch.stack([pair[0] for pair in kv_pairs], dim=1)
+        kv_v = torch.stack([pair[1] for pair in kv_pairs], dim=1)
         # Pi05 has n_heads=1 for the action expert layers; squeeze to (B, n_layers, seq_len, head_dim)
         if kv_k.ndim == 5 and kv_k.shape[2] == 1:
             kv_k = kv_k.squeeze(2)
@@ -1079,12 +1126,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
              torch.ones(batch_size, 1, dtype=run_dtype, device=device)],
             dim=-1,
         )
-        state_norm = (state_features - norm_stats["state_mean"].to(device)) / norm_stats["state_std"].to(device).clamp(min=1e-6)
+        state_norm = (state_features - norm_stats["state_mean"]) / norm_stats["state_std"].clamp(min=1e-6)
         x0_norm = state_norm[:, :state_dim].reshape(batch_size, self.config.chunk_size, self.config.max_action_dim)
         v1_norm = state_norm[:, state_dim:2 * state_dim].reshape(batch_size, self.config.chunk_size, self.config.max_action_dim)
         t1_norm = state_norm[:, -1:].reshape(batch_size, 1)
 
-        model = model.to(device)
         amp_enabled = device.type in ("cuda", "npu")
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             pred_residual_norm = model(
@@ -1098,7 +1144,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pred_residual_norm = pred_residual_norm.to(dtype=torch.float32)
         pred_flat = pred_residual_norm.reshape(batch_size, -1)
         pred_residual = (
-            pred_flat * norm_stats["target_std"].to(device) + norm_stats["target_mean"].to(device)
+            pred_flat * norm_stats["target_std"] + norm_stats["target_mean"]
         ).reshape_as(pred_residual_norm)
 
         x_linear = x0 + (num_steps * dt) * v1
@@ -1130,7 +1176,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             full_att_2d_masks_4d = full_att_2d_masks_4d.to(dtype=self._inference_dtype(x_t.device))
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        past_key_values = copy.deepcopy(past_key_values)
+        # GemmaAttention only reads prefix KV and concatenates local K/V when use_cache=False.
+        # If this call is ever changed to use_cache=True, the cache must be cloned again.
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -1402,6 +1449,14 @@ class PI05Policy(PreTrainedPolicy):
 
         # Get device from model parameters
         device = next(self.parameters()).device
+        image_target_dtype = torch.float32
+        if device.type == "npu":
+            try:
+                image_target_dtype = next(
+                    self.model.paligemma_with_expert.paligemma.model.vision_tower.parameters()
+                ).dtype
+            except StopIteration:
+                image_target_dtype = torch.float32
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
@@ -1420,10 +1475,6 @@ class PI05Policy(PreTrainedPolicy):
             if img.device != device:
                 img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
 
@@ -1433,10 +1484,17 @@ class PI05Policy(PreTrainedPolicy):
 
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
+                if img.dtype != torch.float32:
+                    img = img.to(torch.float32)
                 img = resize_with_pad_torch(img, *self.config.image_resolution)
+            elif device.type != "npu" and img.dtype != torch.float32:
+                # Preserve the original float32 preprocessing path outside NPU inference.
+                img = img.to(torch.float32)
 
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
+            if device.type == "npu" and img.dtype != image_target_dtype:
+                img = img.to(image_target_dtype)
 
             # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:

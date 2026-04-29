@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 
 import torch
 from torch import nn
@@ -75,10 +76,16 @@ class SmolVLMWithExpertModel(nn.Module):
         super().__init__()
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
+            vlm_kwargs = {
+                "torch_dtype": "bfloat16",
+                "low_cpu_mem_usage": True,
+            }
+            attn_implementation = os.environ.get("SPEC_VLA_SMOLVLM_ATTN_IMPLEMENTATION")
+            if attn_implementation:
+                vlm_kwargs["attn_implementation"] = attn_implementation
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                torch_dtype="bfloat16",
-                low_cpu_mem_usage=True,
+                **vlm_kwargs,
             )
             config = self.vlm.config
         else:

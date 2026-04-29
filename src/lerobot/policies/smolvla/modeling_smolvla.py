@@ -73,6 +73,8 @@ from lerobot.policies.utils import (
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.device_utils import get_safe_dtype
 
+_SINUSOIDAL_SCALING_CACHE: dict[tuple[str, int, float, float, torch.dtype], torch.Tensor] = {}
+
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
@@ -90,13 +92,21 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    dtype = get_safe_dtype(torch.float64, device.type)
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
-    period = min_period * (max_period / min_period) ** fraction
+    device_obj = torch.device(device)
+    # NPU executes this path every denoise step; use fp32 directly to avoid repeated
+    # float64 fallback warnings and cache the static scale vector per device.
+    dtype = torch.float32 if device_obj.type == "npu" else get_safe_dtype(torch.float64, device_obj.type)
+    cache_key = (str(device_obj), dimension, float(min_period), float(max_period), dtype)
+    scaling_factor = _SINUSOIDAL_SCALING_CACHE.get(cache_key)
+    if scaling_factor is None:
+        fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device_obj)
+        period = min_period * (max_period / min_period) ** fraction
+        scaling_factor = 1.0 / period * 2 * math.pi
+        _SINUSOIDAL_SCALING_CACHE[cache_key] = scaling_factor
+
     time = time.to(dtype=dtype)
 
     # Compute the outer product
-    scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
     return pos_emb

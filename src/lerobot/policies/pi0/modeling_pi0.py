@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import builtins
-import copy
 import logging
 import math
 from collections import deque
@@ -443,12 +442,19 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
-        # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32). Align with PI05.
+        vision_tower = self.paligemma.model.vision_tower
+        vision_dtype = next(vision_tower.parameters()).dtype
         out_dtype = image.dtype
-        if image.dtype != torch.float32:
-            image = image.to(torch.float32)
+        if image.dtype != vision_dtype:
+            image = image.to(vision_dtype)
         image_outputs = self.paligemma.model.get_image_features(image)
-        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        if isinstance(image_outputs, torch.Tensor):
+            features = image_outputs
+        elif hasattr(image_outputs, "pooler_output"):
+            features = image_outputs.pooler_output
+        else:
+            features = image_outputs.last_hidden_state
+        features = features * self.paligemma.config.text_config.hidden_size**0.5
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
@@ -948,7 +954,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
                 # ── mlp_scheme_g / naive_scheme_g: draft + verify ──
                 can_draft = step + spec_K <= num_steps
-                if spec_method == "mlp_scheme_g":
+                if spec_method in ("mlp_scheme_g", "mlp_no_verify"):
                     can_draft = can_draft and last_hs is not None
                 elif spec_method == "naive_scheme_g":
                     can_draft = can_draft and last_vt is not None
@@ -1070,7 +1076,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             full_att_2d_masks_4d = full_att_2d_masks_4d.to(dtype=self._inference_dtype(x_t.device))
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        past_key_values = copy.deepcopy(past_key_values)
+        # GemmaAttention only reads prefix KV and concatenates local K/V when use_cache=False.
+        # If this call is ever changed to use_cache=True, the cache must be cloned again.
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -1330,6 +1337,14 @@ class PI0Policy(PreTrainedPolicy):
 
         # Get device from model parameters
         device = next(self.parameters()).device
+        image_target_dtype = torch.float32
+        if device.type == "npu":
+            try:
+                image_target_dtype = next(
+                    self.model.paligemma_with_expert.paligemma.model.vision_tower.parameters()
+                ).dtype
+            except StopIteration:
+                image_target_dtype = torch.float32
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
@@ -1347,10 +1362,6 @@ class PI0Policy(PreTrainedPolicy):
             if img.device != device:
                 img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
 
@@ -1360,10 +1371,17 @@ class PI0Policy(PreTrainedPolicy):
 
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
+                if img.dtype != torch.float32:
+                    img = img.to(torch.float32)
                 img = resize_with_pad_torch(img, *self.config.image_resolution)
+            elif device.type != "npu" and img.dtype != torch.float32:
+                # Preserve the original float32 preprocessing path outside NPU inference.
+                img = img.to(torch.float32)
 
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
+            if device.type == "npu" and img.dtype != image_target_dtype:
+                img = img.to(image_target_dtype)
 
             # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:
